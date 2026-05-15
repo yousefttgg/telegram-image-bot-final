@@ -1,5 +1,5 @@
 
-import logging, asyncio, aiosqlite, time, os, re
+import logging, asyncio, aiosqlite, time, os, re, aiohttp
 from datetime import datetime
 from typing import Optional
 import warnings
@@ -937,6 +937,16 @@ async def cb_add_chan(cb: CallbackQuery, state: FSMContext):
         "⚠️ البوت يجب أن يكون مشرفاً في القناة!")
     await state.set_state(St.add_chan)
 
+async def get_chat_id_direct(username: str):
+    """جلب معرف القناة مباشرة عبر طلب HTTP لتجاوز أخطاء Pydantic في aiogram"""
+    url = f"https://api.telegram.org/bot{TOKEN}/getChat"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data={'chat_id': f"@{username}"}) as resp:
+            res = await resp.json()
+            if res.get('ok'):
+                return res['result']['id'], res['result'].get('title', username)
+            return None, res.get('description', 'Unknown error')
+
 @dp.message(St.add_chan)
 async def process_add_chan(msg: Message, state: FSMContext):
     await state.clear()
@@ -950,25 +960,25 @@ async def process_add_chan(msg: Message, state: FSMContext):
         username = raw
 
     if not username: return await msg.answer("❌ يوزرنيم غير صحيح.")
-    channel_id  = f"@{username}"
-    channel_url = f"https://t.me/{username}"
     wm = await msg.answer(f"⏳ جاري التحقق من @{username}...")
+    
+    chat_id_val, chat_title = await get_chat_id_direct(username)
+    if not chat_id_val:
+        try: await wm.delete()
+        except: pass
+        return await msg.answer(f"❌ فشل جلب بيانات القناة:\n<code>{chat_title}</code>")
+
     try:
-        # استخدام طلب خام لتجاوز خطأ ValidationError في aiogram/pydantic
-        from aiogram.methods import GetChat
-        chat_raw = await bot(GetChat(chat_id=channel_id))
-        chat_id_val = chat_raw.id
-        chat_title = getattr(chat_raw, 'title', username)
-        
         me     = await bot.get_me()
         member = await bot.get_chat_member(chat_id=chat_id_val, user_id=me.id)
         if member.status not in ('administrator','creator'):
             try: await wm.delete()
             except: pass
             return await msg.answer(f"❌ البوت ليس مشرفاً في @{username}.\nأضفه كمسؤول وأعد المحاولة.")
+        
         await db_write(
             "INSERT OR REPLACE INTO channels (id,url,username) VALUES (?,?,?)",
-            (str(chat_id_val), channel_url, f"@{username}"))
+            (str(chat_id_val), f"https://t.me/{username}", f"@{username}"))
         cache_del("channels_list")
         try: await wm.delete()
         except: pass
@@ -976,14 +986,6 @@ async def process_add_chan(msg: Message, state: FSMContext):
     except Exception as e:
         try: await wm.delete()
         except: pass
-        
-        if "ValidationError" in str(e):
-            logger.error(f"Pydantic Error: {e}")
-            return await msg.answer("❌ خطأ في التحقق من بيانات القناة. يرجى التأكد من أن البوت مشرف في القناة.")
-        
-        if isinstance(e, TelegramBadRequest):
-            return await msg.answer(f"❌ لم يتم العثور على القناة أو البوت ليس مشرفاً:\n<code>{str(e)[:200]}</code>")
-        
         await msg.answer(f"❌ خطأ: <code>{str(e)[:200]}</code>")
 
 @dp.callback_query(F.data.startswith("del_chan_"))
