@@ -1,13 +1,16 @@
-FROM python:3.9-slim
+FROM python:3.11-slim
 
-# ضبط بيئة العمل داخل السيرفر
 WORKDIR /app
 
-# نسخ جميع ملفاتك (main.py, requirements.txt) إلى السيرفر
-COPY . .
+# تثبيت المكتبات
+RUN pip install --no-cache-dir \
+    aiogram==3.7.0 \
+    aiosqlite \
+    aiohttp
 
-# تثبيت المكتبات المطلوبة
-RUN pip install --no-cache-dir -r requirements.txt
+COPY main.py .
 
-# الأمر البرمجي لتشغيل البوت (تأكد أن الاسم main.py مطابق لملفك)
+# لا تغيّر المنفذ هنا، سيُعرَّف في الكود
+EXPOSE 8080
+
 CMD ["python", "main.py"]
