@@ -23,15 +23,12 @@ from aiogram.exceptions import (
     TelegramConflictError, TelegramBadRequest
 )
 
-# asyncpg للتواصل مع Supabase PostgreSQL
 import asyncpg
 
 # ─── الإعدادات ────────────────────────────────────────────────────────────────
 TOKEN     = os.environ.get("BOT_TOKEN", "8066171928:AAHXhDfWSWLTFfgBekExFGSyveJSnIT2Dsg")
 ADMIN_IDS = [8605977767, 8774463579]
 
-# ضع رابط قاعدة بيانات Supabase هنا أو في متغير البيئة DATABASE_URL
-# مثال: postgresql://postgres:PASSWORD@db.xxxx.supabase.co:5432/postgres
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 logging.basicConfig(
@@ -65,7 +62,7 @@ def cache_del(*keys):
 def cache_clear_all():
     _cache.clear(); _cache_ts.clear()
 
-# ─── قاعدة البيانات (PostgreSQL / Supabase) ──────────────────────────────────
+# ─── قاعدة البيانات ───────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
 
 async def get_pool() -> asyncpg.Pool:
@@ -75,7 +72,6 @@ async def get_pool() -> asyncpg.Pool:
     return _pool
 
 async def db_read(query: str, params=(), one=False):
-    """قراءة من قاعدة البيانات - تحويل ? إلى $1,$2,... تلقائياً"""
     pool = await get_pool()
     pg_query = _convert_query(query)
     async with pool.acquire() as conn:
@@ -87,10 +83,8 @@ async def db_read(query: str, params=(), one=False):
             return [dict(r) for r in rows]
 
 async def db_write(query: str, params=(), ret_id=False):
-    """كتابة في قاعدة البيانات"""
     pool = await get_pool()
     pg_query = _convert_query(query)
-    # لإرجاع الـ ID نضيف RETURNING id
     if ret_id and "RETURNING" not in pg_query.upper():
         pg_query = pg_query.rstrip(";") + " RETURNING id"
     async with pool.acquire() as conn:
@@ -102,28 +96,24 @@ async def db_write(query: str, params=(), ret_id=False):
             return None
 
 def _convert_query(query: str) -> str:
-    """تحويل صيغة SQLite (?) إلى PostgreSQL ($1, $2, ...)"""
     result = []
     idx = 1
     i = 0
     while i < len(query):
-        if query[i] == '?' :
+        if query[i] == '?':
             result.append(f'${idx}')
             idx += 1
         else:
             result.append(query[i])
         i += 1
-    # تحويل AUTOINCREMENT
     q = ''.join(result)
     q = q.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY')
     q = q.replace('INTEGER PRIMARY KEY', 'BIGINT PRIMARY KEY')
-    # تحويل datetime SQLite
     q = q.replace("datetime('now','localtime')", "NOW()")
     q = q.replace("datetime('now')", "NOW()")
     return q
 
 async def init_db():
-    """إنشاء الجداول إذا لم تكن موجودة (يعمل عند كل تشغيل بأمان)"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute('''
@@ -183,17 +173,14 @@ async def init_db():
             )
         ''')
 
-        # إنشاء الفهارس
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_sections_parent ON sections(parent_id)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_content_section ON content(section_id)')
 
-        # الأقسام الافتراضية فقط إذا كانت القاعدة فارغة
         count = await conn.fetchval("SELECT COUNT(*) FROM sections WHERE parent_id IS NULL")
         if count == 0:
             for sec in ["الملازم", "التحفيز", "ارشادات للدراسة", "الملخصات"]:
                 await conn.execute("INSERT INTO sections (name) VALUES ($1)", sec)
 
-        # الإعدادات الافتراضية
         for k, v in [('sub_notify','OFF'), ('entry_notify','OFF'),
                      ('help_text','أهلاً بك في بوت المساعد الدراسي 🎓')]:
             await conn.execute(
@@ -1000,9 +987,16 @@ async def process_add_chan(msg: Message, state: FSMContext):
             try: await wm.delete()
             except: pass
             return await msg.answer(f"❌ البوت ليس مشرفاً في @{username}.\nأضفه كمسؤول وأعد المحاولة.")
-        await db_write(
-            "INSERT INTO channels (id,url,username) VALUES (?,?,?) ON CONFLICT (id) DO UPDATE SET url=EXCLUDED.url, username=EXCLUDED.username",
-            (str(chat_id_val), f"https://t.me/{username}", f"@{username}"))
+        # ─── إصلاح: استخدام ON CONFLICT الصحيح لـ PostgreSQL ───────────────
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO channels (id, url, username)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT (id) DO UPDATE
+                   SET url = EXCLUDED.url, username = EXCLUDED.username""",
+                str(chat_id_val), f"https://t.me/{username}", f"@{username}"
+            )
         cache_del("channels_list")
         try: await wm.delete()
         except: pass
@@ -1061,40 +1055,71 @@ async def cb_adm_help(cb: CallbackQuery, state: FSMContext):
 @dp.message(St.edit_help)
 async def process_edit_help(msg: Message, state: FSMContext):
     await state.clear()
-    await db_write("UPDATE settings SET value=? WHERE key='help_text'", (msg.text,))
-    await msg.answer("✅ تم تحديث نص الشرح.")
+    new_text = msg.text.strip()
+    if not new_text:
+        return await msg.answer("❌ النص فارغ، لم يتم التحديث.")
+    await db_write("UPDATE settings SET value=? WHERE key=?", (new_text, 'help_text'))
+    await msg.answer("✅ تم تحديث نص الشرح بنجاح.")
 
-# ─── Health Check ─────────────────────────────────────────────────────────────
-from aiohttp import web
+# ─── قناة البوت ───────────────────────────────────────────────────────────────
+@dp.message(F.text == "📢 قناة البوت")
+async def show_bot_channel(msg: Message):
+    chans = await db_read("SELECT url, username FROM channels LIMIT 1")
+    if chans:
+        c = chans[0]
+        b = InlineKeyboardBuilder()
+        b.row(InlineKeyboardButton(text="📢 انضم للقناة", url=c['url']))
+        await msg.answer("📢 قناة البوت الرسمية:", reply_markup=b.as_markup())
+    else:
+        await msg.answer("لا توجد قناة مضافة حالياً.")
 
-async def health_handler(request):
-    return web.Response(text="OK", status=200)
+# ─── شرح البوت ────────────────────────────────────────────────────────────────
+@dp.message(F.text == "ℹ️ شرح البوت")
+async def show_help_text(msg: Message):
+    res = await db_read("SELECT value FROM settings WHERE key='help_text'", one=True)
+    await msg.answer(res['value'] if res else "لا يوجد شرح.")
 
-async def start_health_server():
-    app = web.Application()
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
-    await site.start()
-    logger.warning("Health server started on port 8080")
+# ─── السادس العلمي ────────────────────────────────────────────────────────────
+@dp.message(F.text == "🔬 السادس علمي")
+async def show_sixth_science(msg: Message):
+    if not await check_subscription(msg.from_user.id):
+        return await msg.answer("⚠️ اشترك أولاً:", reply_markup=await get_sub_kb())
+    secs = await db_read("SELECT * FROM sections WHERE parent_id IS NULL")
+    b = InlineKeyboardBuilder()
+    for s in (secs or []):
+        icons = {"الملازم":"🗂","التحفيز":"💡","ارشادات":"📝","الملخصات":"📚"}
+        icon = next((v for k,v in icons.items() if k in s['name']), "📁")
+        b.row(InlineKeyboardButton(text=f"{icon} {s['name']}", callback_data=f"user_sec_{s['id']}"))
+    await msg.answer("🔬 <b>السادس العلمي - اختر القسم:</b>", reply_markup=b.as_markup())
 
-# ─── تشغيل البوت ──────────────────────────────────────────────────────────────
+# ─── التشغيل الرئيسي ─────────────────────────────────────────────────────────
 async def main():
-    if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL غير محدد! أضفه في متغيرات البيئة.")
-        return
     await init_db()
     await setup_commands()
-    await start_health_server()
-    asyncio.create_task(cleanup_blocked())
-    logger.warning("Bot started with PostgreSQL/Supabase.")
+
+    # ─── إصلاح TelegramConflictError: حذف الـ webhook وتنظيف pending updates ──
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    finally:
-        if _pool:
-            await _pool.close()
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.warning("✅ تم حذف الـ webhook وتنظيف الرسائل المعلقة")
+    except Exception as e:
+        logger.warning(f"delete_webhook: {e}")
+
+    asyncio.create_task(cleanup_blocked())
+
+    logger.warning("🚀 البوت يعمل الآن...")
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        # ─── إصلاح: تجاهل الأخطاء وإعادة المحاولة بدلاً من التوقف ──────────
+        handle_signals=True,
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.warning("⛔ البوت أُوقف يدوياً.")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        sys.exit(1)
