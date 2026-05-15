@@ -1123,12 +1123,37 @@ async def process_edit_help(msg: Message, state: FSMContext):
     await msg.answer("✅ تم تحديث نص الشرح.")
 
 # ─── التشغيل ──────────────────────────────────────────────────────────────────
+# ─── Health Check Server (مطلوب لـ Back4app) ─────────────────────────────────
+from aiohttp import web
+
+async def health_handler(request):
+    return web.Response(text="OK", status=200)
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    await site.start()
+    logger.warning("Health server started on port 8080")
+
+# ─── تشغيل البوت ──────────────────────────────────────────────────────────────
 async def main():
     await init_db()
     await setup_commands()
+    
+    # تشغيل health server و cleanup بالتوازي مع البوت
+    await start_health_server()
     asyncio.create_task(cleanup_blocked())
-    logger.warning("البوت يعمل...")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    
+    logger.warning("Bot started.")
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        if _db:
+            await _db.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
