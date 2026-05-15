@@ -1,5 +1,4 @@
-
-import logging, asyncio, aiosqlite, time, os, re, aiohttp
+import logging, asyncio, time, os, re, aiohttp
 from datetime import datetime
 from typing import Optional
 import warnings
@@ -24,10 +23,16 @@ from aiogram.exceptions import (
     TelegramConflictError, TelegramBadRequest
 )
 
+# asyncpg للتواصل مع Supabase PostgreSQL
+import asyncpg
+
 # ─── الإعدادات ────────────────────────────────────────────────────────────────
-TOKEN     = "8066171928:AAHXhDfWSWLTFfgBekExFGSyveJSnIT2Dsg"
-ADMIN_IDS = [8605977767, 8774463579]   # المالكون الأساسيون
-DB_PATH   = "bot_data.db"
+TOKEN     = os.environ.get("BOT_TOKEN", "8066171928:AAHXhDfWSWLTFfgBekExFGSyveJSnIT2Dsg")
+ADMIN_IDS = [8605977767, 8774463579]
+
+# ضع رابط قاعدة بيانات Supabase هنا أو في متغير البيئة DATABASE_URL
+# مثال: postgresql://postgres:PASSWORD@db.xxxx.supabase.co:5432/postgres
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -60,106 +65,140 @@ def cache_del(*keys):
 def cache_clear_all():
     _cache.clear(); _cache_ts.clear()
 
-# ─── قاعدة البيانات ───────────────────────────────────────────────────────────
-_db: Optional[aiosqlite.Connection] = None
+# ─── قاعدة البيانات (PostgreSQL / Supabase) ──────────────────────────────────
+_pool: Optional[asyncpg.Pool] = None
 
-async def get_db() -> aiosqlite.Connection:
-    global _db
-    if _db is None:
-        _db = await aiosqlite.connect(DB_PATH)
-        _db.row_factory = aiosqlite.Row
-        for pragma in ["PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL",
-                       "PRAGMA cache_size=-8000", "PRAGMA temp_store=MEMORY"]:
-            await _db.execute(pragma)
-    return _db
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    return _pool
 
-async def db_read(query, params=(), one=False):
-    db = await get_db()
-    cur = await db.execute(query, params)
-    res = await (cur.fetchone() if one else cur.fetchall())
-    await cur.close()
-    return res
+async def db_read(query: str, params=(), one=False):
+    """قراءة من قاعدة البيانات - تحويل ? إلى $1,$2,... تلقائياً"""
+    pool = await get_pool()
+    pg_query = _convert_query(query)
+    async with pool.acquire() as conn:
+        if one:
+            row = await conn.fetchrow(pg_query, *params)
+            return dict(row) if row else None
+        else:
+            rows = await conn.fetch(pg_query, *params)
+            return [dict(r) for r in rows]
 
-async def db_write(query, params=(), ret_id=False):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA synchronous=NORMAL")
-        cur = await db.execute(query, params)
-        last_id = cur.lastrowid
-        await db.commit()
-        await cur.close()
-    return last_id if ret_id else None
+async def db_write(query: str, params=(), ret_id=False):
+    """كتابة في قاعدة البيانات"""
+    pool = await get_pool()
+    pg_query = _convert_query(query)
+    # لإرجاع الـ ID نضيف RETURNING id
+    if ret_id and "RETURNING" not in pg_query.upper():
+        pg_query = pg_query.rstrip(";") + " RETURNING id"
+    async with pool.acquire() as conn:
+        if ret_id:
+            row = await conn.fetchrow(pg_query, *params)
+            return row['id'] if row else None
+        else:
+            await conn.execute(pg_query, *params)
+            return None
+
+def _convert_query(query: str) -> str:
+    """تحويل صيغة SQLite (?) إلى PostgreSQL ($1, $2, ...)"""
+    result = []
+    idx = 1
+    i = 0
+    while i < len(query):
+        if query[i] == '?' :
+            result.append(f'${idx}')
+            idx += 1
+        else:
+            result.append(query[i])
+        i += 1
+    # تحويل AUTOINCREMENT
+    q = ''.join(result)
+    q = q.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY')
+    q = q.replace('INTEGER PRIMARY KEY', 'BIGINT PRIMARY KEY')
+    # تحويل datetime SQLite
+    q = q.replace("datetime('now','localtime')", "NOW()")
+    q = q.replace("datetime('now')", "NOW()")
+    return q
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL")
-        await db.executescript('''
+    """إنشاء الجداول إذا لم تكن موجودة (يعمل عند كل تشغيل بأمان)"""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                user_id   INTEGER PRIMARY KEY,
+                user_id   BIGINT PRIMARY KEY,
                 username  TEXT,
                 joined_at TEXT,
                 is_active INTEGER DEFAULT 1
-            );
+            )
+        ''')
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS sections (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                id        SERIAL PRIMARY KEY,
                 name      TEXT,
                 parent_id INTEGER DEFAULT NULL
-            );
+            )
+        ''')
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS content (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                id         SERIAL PRIMARY KEY,
                 section_id INTEGER,
                 name       TEXT,
                 type       TEXT,
                 data       TEXT,
                 file_id    TEXT,
                 pinned     INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT (datetime('now','localtime'))
-            );
+                created_at TEXT DEFAULT to_char(NOW(), 'YYYY-MM-DD HH24:MI')
+            )
+        ''')
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT
-            );
+            )
+        ''')
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS channels (
                 id       TEXT PRIMARY KEY,
                 url      TEXT,
                 username TEXT
-            );
+            )
+        ''')
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS sub_admins (
-                user_id INTEGER PRIMARY KEY
-            );
+                user_id BIGINT PRIMARY KEY
+            )
+        ''')
+        await conn.execute('''
             CREATE TABLE IF NOT EXISTS requests (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER,
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT,
                 username   TEXT,
                 full_name  TEXT,
                 message    TEXT,
-                created_at TEXT DEFAULT (datetime('now','localtime')),
+                created_at TEXT DEFAULT to_char(NOW(), 'YYYY-MM-DD HH24:MI'),
                 answered   INTEGER DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_sections_parent ON sections(parent_id);
-            CREATE INDEX IF NOT EXISTS idx_content_section ON content(section_id);
+            )
         ''')
-        # إضافة أعمدة جديدة إذا لم تكن موجودة
-        for alter in [
-            "ALTER TABLE channels ADD COLUMN username TEXT",
-            "ALTER TABLE content ADD COLUMN pinned INTEGER DEFAULT 0",
-            "ALTER TABLE content ADD COLUMN created_at TEXT DEFAULT (datetime('now','localtime'))"
-        ]:
-            try: await db.execute(alter)
-            except: pass
 
-        # ── إضافة الأقسام الافتراضية فقط إذا كانت القاعدة فارغة تماماً ──
-        count = await db.execute("SELECT COUNT(*) FROM sections WHERE parent_id IS NULL")
-        row = await count.fetchone()
-        if row[0] == 0:
+        # إنشاء الفهارس
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_sections_parent ON sections(parent_id)')
+        await conn.execute('CREATE INDEX IF NOT EXISTS idx_content_section ON content(section_id)')
+
+        # الأقسام الافتراضية فقط إذا كانت القاعدة فارغة
+        count = await conn.fetchval("SELECT COUNT(*) FROM sections WHERE parent_id IS NULL")
+        if count == 0:
             for sec in ["الملازم", "التحفيز", "ارشادات للدراسة", "الملخصات"]:
-                await db.execute("INSERT INTO sections (name) VALUES (?)", (sec,))
+                await conn.execute("INSERT INTO sections (name) VALUES ($1)", sec)
 
+        # الإعدادات الافتراضية
         for k, v in [('sub_notify','OFF'), ('entry_notify','OFF'),
                      ('help_text','أهلاً بك في بوت المساعد الدراسي 🎓')]:
-            await db.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (k,v))
-        await db.commit()
+            await conn.execute(
+                "INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING",
+                k, v)
 
 # ─── مساعدات ──────────────────────────────────────────────────────────────────
 async def get_sub_admins() -> list:
@@ -345,7 +384,7 @@ async def send_panel(msg: Message, uid: int):
 @dp.callback_query(F.data == "adm_back")
 async def cb_back(cb: CallbackQuery): await send_panel(cb.message, cb.from_user.id)
 
-# ─── عرض الطلبات الواردة (للمالك فقط) ───────────────────────────────────────
+# ─── عرض الطلبات الواردة ─────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_requests")
 async def cb_adm_requests(cb: CallbackQuery):
     if not await is_admin(cb.from_user.id):
@@ -372,7 +411,7 @@ async def cb_view_req(cb: CallbackQuery, state: FSMContext):
     if not await is_admin(cb.from_user.id):
         return await cb.answer("لا صلاحية.", show_alert=True)
     req_id = cb.data.split("view_req_")[1]
-    req = await db_read("SELECT * FROM requests WHERE id=?", (req_id,), one=True)
+    req = await db_read("SELECT * FROM requests WHERE id=?", (int(req_id),), one=True)
     if not req: return await cb.answer("❌ غير موجود", show_alert=True)
     text = (
         f"📩 <b>طلب #{req['id']}</b>\n"
@@ -408,12 +447,12 @@ async def process_reply_request(msg: Message, state: FSMContext):
     await state.clear()
     try:
         await bot.send_message(user_id, f"📩 <b>رد على طلبك #{req_id}:</b>\n\n{msg.text}")
-        await db_write("UPDATE requests SET answered=1 WHERE id=?", (req_id,))
+        await db_write("UPDATE requests SET answered=1 WHERE id=?", (int(req_id),))
         await msg.answer("✅ تم إرسال الرد وتحديد الطلب كمجاب.")
     except Exception as e:
         await msg.answer(f"❌ فشل الإرسال: {e}")
 
-# ─── الإحصائيات المتقدمة ──────────────────────────────────────────────────────
+# ─── الإحصائيات ───────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_stats")
 async def cb_stats(cb: CallbackQuery):
     if not await is_admin(cb.from_user.id):
@@ -427,7 +466,7 @@ async def cb_stats(cb: CallbackQuery):
     top_sec = await db_read(
         "SELECT s.name, COUNT(c.id) cnt FROM sections s "
         "LEFT JOIN content c ON c.section_id=s.id "
-        "GROUP BY s.id ORDER BY cnt DESC LIMIT 3")
+        "GROUP BY s.id, s.name ORDER BY cnt DESC LIMIT 3")
     top_txt = "\n".join(f"  • {r['name']}: {r['cnt']}" for r in (top_sec or []))
     recent  = await db_read("SELECT name, created_at FROM content ORDER BY id DESC LIMIT 5")
     recent_txt = "\n".join(
@@ -582,9 +621,10 @@ async def process_sec_name(msg: Message, state: FSMContext):
     name = msg.text.strip()
     if not name: return await msg.answer("❌ الاسم فارغ، أرسل مجدداً:")
     try:
+        parent_id = int(data['parent_id']) if data.get('parent_id') else None
         row_id = await db_write(
             "INSERT INTO sections (name,parent_id) VALUES (?,?)",
-            (name, data.get('parent_id')), ret_id=True)
+            (name, parent_id), ret_id=True)
         cache_del("main_secs")
         await msg.answer(f"✅ تم إضافة '<b>{name}</b>' (ID: {row_id})")
     except Exception as e: await msg.answer(f"❌ خطأ: <code>{str(e)[:200]}</code>")
@@ -594,7 +634,7 @@ async def delete_section_recursive(sec_id: int, deleted_by: int = None):
     sec_info = await db_read("SELECT name FROM sections WHERE id=?", (sec_id,), one=True)
     contents = await db_read("SELECT name FROM content WHERE section_id=?", (sec_id,))
     con_names = ", ".join([c['name'] for c in contents]) if contents else "لا يوجد"
-    
+
     await db_write("DELETE FROM content WHERE section_id=?", (sec_id,))
     subs = await db_read("SELECT id FROM sections WHERE parent_id=?", (sec_id,))
     for sub in (subs or []): await delete_section_recursive(sub['id'], deleted_by)
@@ -660,7 +700,7 @@ async def process_con_data(msg: Message, state: FSMContext):
     try:
         row_id = await db_write(
             "INSERT INTO content (section_id,name,type,data,file_id,created_at) VALUES (?,?,?,?,?,?)",
-            (data['sec_id'], data['con_name'], c_type, c_data, f_id,
+            (int(data['sec_id']), data['con_name'], c_type, c_data, f_id,
              datetime.now().strftime("%Y-%m-%d %H:%M")), ret_id=True)
         cache_clear_all()
         await msg.answer(f"✅ <b>تم الحفظ!</b>\n📌 {data['con_name']}\n📎 {c_type}\n🆔 {row_id}")
@@ -668,7 +708,7 @@ async def process_con_data(msg: Message, state: FSMContext):
         adder_id = msg.from_user.id
         try: adder_name = (await bot.get_chat(adder_id)).full_name
         except: adder_name = f"ID:{adder_id}"
-        sec_info = await db_read("SELECT name FROM sections WHERE id=?", (data['sec_id'],), one=True)
+        sec_info = await db_read("SELECT name FROM sections WHERE id=?", (int(data['sec_id']),), one=True)
         notif = (
             f"➕ <b>تنبيه إضافة محتوى</b>\n\n"
             f"👮 المشرف: <b>{adder_name}</b> (<code>{adder_id}</code>)\n"
@@ -687,7 +727,7 @@ async def process_con_data(msg: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("del_con_"))
 async def cb_del_con(cb: CallbackQuery):
     c_id = cb.data.split("del_con_")[1]
-    item = await db_read("SELECT name,section_id FROM content WHERE id=?", (c_id,), one=True)
+    item = await db_read("SELECT name,section_id FROM content WHERE id=?", (int(c_id),), one=True)
     if not item: return await cb.answer("❌ غير موجود", show_alert=True)
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="✅ نعم، احذف", callback_data=f"confirm_del_{c_id}"),
@@ -701,11 +741,11 @@ async def cb_del_con(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("confirm_del_"))
 async def cb_confirm_del(cb: CallbackQuery):
     c_id = cb.data.split("confirm_del_")[1]
-    item = await db_read("SELECT * FROM content WHERE id=?", (c_id,), one=True)
+    item = await db_read("SELECT * FROM content WHERE id=?", (int(c_id),), one=True)
     if not item: return await cb.answer("❌ محذوف مسبقاً", show_alert=True)
 
     deleter_id = cb.from_user.id
-    await db_write("DELETE FROM content WHERE id=?", (c_id,))
+    await db_write("DELETE FROM content WHERE id=?", (int(c_id),))
     cache_clear_all()
     await cb.answer("✅ تم الحذف نهائياً")
 
@@ -745,29 +785,21 @@ async def process_search(msg: Message, state: FSMContext):
     query = msg.text.strip()
     if len(query) < 2: return await msg.answer("❌ كلمة البحث قصيرة جداً.")
     await state.clear()
-    
-    # بحث في الأقسام
     secs = await db_read("SELECT * FROM sections WHERE name LIKE ?", (f"%{query}%",))
-    # بحث في المحتوى
     cons = await db_read("SELECT * FROM content WHERE name LIKE ? OR data LIKE ?", (f"%{query}%", f"%{query}%"))
-    
     if not secs and not cons:
         return await msg.answer("❌ لم يتم العثور على نتائج.")
-    
     b = InlineKeyboardBuilder()
     res_text = f"🔍 نتائج البحث عن: <b>{query}</b>\n"
-    
     if secs:
         res_text += f"\n📂 <b>الأقسام ({len(secs)}):</b>"
         for s in secs:
             b.row(InlineKeyboardButton(text=f"📁 {s['name']}", callback_data=f"user_sec_{s['id']}"))
-            
     if cons:
         res_text += f"\n📄 <b>الملفات ({len(cons)}):</b>"
         for c in cons:
             icon = {"photo":"🖼","doc":"📄","voice":"🎤","video":"🎥","audio":"🎵"}.get(c['type'],"📝")
             b.row(InlineKeyboardButton(text=f"{icon} {c['name']}", callback_data=f"user_view_{c['id']}"))
-            
     await msg.answer(res_text, reply_markup=b.as_markup())
 
 # ─── طلب ملزمة ───────────────────────────────────────────────────────────────
@@ -785,10 +817,7 @@ async def process_send_request(msg: Message, state: FSMContext):
     req_id = await db_write(
         "INSERT INTO requests (user_id, username, full_name, message) VALUES (?,?,?,?)",
         (u.id, u.username, u.full_name, msg.text), ret_id=True)
-    
     await msg.answer(f"✅ تم إرسال طلبك بنجاح (رقم الطلب: #{req_id}). سيتم الرد عليك قريباً.")
-    
-    # إشعار المالكين
     notif = (
         f"📩 <b>طلب جديد #{req_id}</b>\n"
         f"👤 {u.full_name} (@{u.username or '—'})\n"
@@ -852,7 +881,7 @@ async def cb_user_sec(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("user_view_"))
 async def cb_user_view(cb: CallbackQuery):
     c_id = cb.data.split("user_view_")[1]
-    item = await db_read("SELECT * FROM content WHERE id=?", (c_id,), one=True)
+    item = await db_read("SELECT * FROM content WHERE id=?", (int(c_id),), one=True)
     if not item: return await cb.answer("❌ غير موجود", show_alert=True)
     cap = item['data'] or ""
     try:
@@ -938,7 +967,6 @@ async def cb_add_chan(cb: CallbackQuery, state: FSMContext):
     await state.set_state(St.add_chan)
 
 async def get_chat_id_direct(username: str):
-    """جلب معرف القناة مباشرة عبر طلب HTTP لتجاوز أخطاء Pydantic في aiogram"""
     url = f"https://api.telegram.org/bot{TOKEN}/getChat"
     async with aiohttp.ClientSession() as session:
         async with session.post(url, data={'chat_id': f"@{username}"}) as resp:
@@ -958,16 +986,13 @@ async def process_add_chan(msg: Message, state: FSMContext):
         username = raw[1:]
     else:
         username = raw
-
     if not username: return await msg.answer("❌ يوزرنيم غير صحيح.")
     wm = await msg.answer(f"⏳ جاري التحقق من @{username}...")
-    
     chat_id_val, chat_title = await get_chat_id_direct(username)
     if not chat_id_val:
         try: await wm.delete()
         except: pass
         return await msg.answer(f"❌ فشل جلب بيانات القناة:\n<code>{chat_title}</code>")
-
     try:
         me     = await bot.get_me()
         member = await bot.get_chat_member(chat_id=chat_id_val, user_id=me.id)
@@ -975,9 +1000,8 @@ async def process_add_chan(msg: Message, state: FSMContext):
             try: await wm.delete()
             except: pass
             return await msg.answer(f"❌ البوت ليس مشرفاً في @{username}.\nأضفه كمسؤول وأعد المحاولة.")
-        
         await db_write(
-            "INSERT OR REPLACE INTO channels (id,url,username) VALUES (?,?,?)",
+            "INSERT INTO channels (id,url,username) VALUES (?,?,?) ON CONFLICT (id) DO UPDATE SET url=EXCLUDED.url, username=EXCLUDED.username",
             (str(chat_id_val), f"https://t.me/{username}", f"@{username}"))
         cache_del("channels_list")
         try: await wm.delete()
@@ -1040,7 +1064,7 @@ async def process_edit_help(msg: Message, state: FSMContext):
     await db_write("UPDATE settings SET value=? WHERE key='help_text'", (msg.text,))
     await msg.answer("✅ تم تحديث نص الشرح.")
 
-# ─── Health Check Server ──────────────────────────────────────────────────────
+# ─── Health Check ─────────────────────────────────────────────────────────────
 from aiohttp import web
 
 async def health_handler(request):
@@ -1058,16 +1082,19 @@ async def start_health_server():
 
 # ─── تشغيل البوت ──────────────────────────────────────────────────────────────
 async def main():
+    if not DATABASE_URL:
+        logger.error("❌ DATABASE_URL غير محدد! أضفه في متغيرات البيئة.")
+        return
     await init_db()
     await setup_commands()
     await start_health_server()
     asyncio.create_task(cleanup_blocked())
-    logger.warning("Bot started.")
+    logger.warning("Bot started with PostgreSQL/Supabase.")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        if _db:
-            await _db.close()
+        if _pool:
+            await _pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
