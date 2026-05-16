@@ -202,48 +202,35 @@ async def init_db():
                 k, v,
             )
 
-# ─── HTTP Health Check ────────────────────────────────────────────────────────
-def start_health_server():
-    response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK"
+# ─── HTTP Health Check (asyncio - بدون thread) ───────────────────────────────
+async def handle_health(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        await reader.read(1024)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK")
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
-    def serve():
-        bind_addresses = ["0.0.0.0", "127.0.0.1", "::"]
-        server_socket = None
-
-        for addr in bind_addresses:
-            try:
-                family = socket.AF_INET6 if addr == "::" else socket.AF_INET
-                s = socket.socket(family, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((addr, PORT))
-                s.listen(5)
-                s.settimeout(1)
-                server_socket = s
-                logger.warning(f"✅ HTTP server على {addr}:{PORT}")
-                break
-            except OSError as e:
-                logger.warning(f"⚠️ فشل الربط بـ {addr}:{PORT} — {e}")
-                continue
-
-        if not server_socket:
-            logger.error("❌ فشل تشغيل HTTP server على جميع العناوين — البوت سيستمر بدونه")
+async def start_health_server():
+    """يشغّل health server بـ asyncio — يتجنب Errno 99 لأنه يعمل بعد استقرار الـ network"""
+    last_err = None
+    for attempt in range(10):
+        try:
+            server = await asyncio.start_server(handle_health, "0.0.0.0", PORT)
+            logger.warning(f"✅ HTTP health server على 0.0.0.0:{PORT}")
+            asyncio.create_task(server.serve_forever())
             return
-
-        while True:
-            try:
-                conn, _ = server_socket.accept()
-                try:
-                    conn.recv(1024)
-                    conn.sendall(response)
-                finally:
-                    conn.close()
-            except socket.timeout:
-                continue
-            except Exception:
-                continue
-
-    t = threading.Thread(target=serve, daemon=True)
-    t.start()
+        except OSError as e:
+            last_err = e
+            logger.warning(f"⚠️ محاولة {attempt + 1}/10 فشلت: {e} — إعادة المحاولة بعد 3 ثوانٍ")
+            await asyncio.sleep(3)
+    logger.error(f"❌ فشل تشغيل health server بعد 10 محاولات: {last_err} — البوت سيستمر بدونه")
 
 # ─── مساعدات ──────────────────────────────────────────────────────────────────
 async def get_sub_admins() -> list:
@@ -1266,32 +1253,29 @@ async def show_sixth_science(msg: Message):
 
 # ─── التشغيل الرئيسي ─────────────────────────────────────────────────────────
 async def main():
-    # 1) HTTP health server في thread منفصل
-    start_health_server()
-
-    # 2) انتظر قليلاً حتى يستقر الـ network
-    await asyncio.sleep(2)
-
-    # 3) Supabase
+    # 1) Supabase أولاً
     await init_db()
     logger.warning("✅ Supabase جاهزة")
 
-    # 4) أوامر البوت
+    # 2) أوامر البوت
     await setup_commands()
 
-    # 5) حذف webhook القديم
+    # 3) حذف webhook القديم
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.warning("✅ تم حذف الـ webhook")
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
 
-    # 6) مهمة تنظيف المحظورين
+    # 4) تشغيل health server بـ asyncio بعد استقرار الـ network
+    await start_health_server()
+
+    # 5) مهمة تنظيف المحظورين
     asyncio.create_task(cleanup_blocked())
 
     logger.warning("🚀 البوت يعمل...")
 
-    # 7) polling
+    # 6) polling
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types(),
