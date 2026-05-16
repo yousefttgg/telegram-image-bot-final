@@ -3,15 +3,16 @@ import asyncio
 import time
 import os
 import re
-import socket
-import threading
 from datetime import datetime
 from typing import Optional
 import warnings
 warnings.filterwarnings("ignore", message='Field "model_.*".*')
 
 import aiohttp
-import asyncpg
+from aiohttp import web
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool as pg_pool
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -78,24 +79,38 @@ def cache_clear_all():
     _cache.clear()
     _cache_ts.clear()
 
-# ─── قاعدة البيانات ───────────────────────────────────────────────────────────
-_pool: Optional[asyncpg.Pool] = None
+# ─── قاعدة البيانات (psycopg2 + thread pool) ─────────────────────────────────
+_db_pool: Optional[pg_pool.ThreadedConnectionPool] = None
+_db_lock = asyncio.Lock()
 
-async def get_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(
-            DATABASE_URL, min_size=1, max_size=10, ssl="require"
-        )
-    return _pool
+def _get_dsn() -> str:
+    """تحويل DATABASE_URL إلى DSN مناسب لـ psycopg2."""
+    url = DATABASE_URL
+    # استبدال %40 بـ @
+    url = url.replace("%40", "@")
+    return url
+
+def _init_pool() -> pg_pool.ThreadedConnectionPool:
+    dsn = _get_dsn()
+    return pg_pool.ThreadedConnectionPool(
+        minconn=1,
+        maxconn=10,
+        dsn=dsn,
+        sslmode="require",
+    )
+
+def _get_pool() -> pg_pool.ThreadedConnectionPool:
+    global _db_pool
+    if _db_pool is None:
+        _db_pool = _init_pool()
+    return _db_pool
 
 def _convert_query(query: str) -> str:
+    """تحويل ? إلى %s وتحويل صياغات SQLite إلى PostgreSQL."""
     result = []
-    idx = 1
     for ch in query:
         if ch == "?":
-            result.append(f"${idx}")
-            idx += 1
+            result.append("%s")
         else:
             result.append(ch)
     q = "".join(result)
@@ -105,132 +120,157 @@ def _convert_query(query: str) -> str:
     q = q.replace("datetime('now')", "NOW()")
     return q
 
+def _db_read_sync(query: str, params=(), one=False):
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            pg = _convert_query(query)
+            cur.execute(pg, params if params else None)
+            if one:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+    finally:
+        pool.putconn(conn)
+
+def _db_write_sync(query: str, params=(), ret_id=False):
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            pg = _convert_query(query)
+            if ret_id and "RETURNING" not in pg.upper():
+                pg = pg.rstrip(";") + " RETURNING id"
+            cur.execute(pg, params if params else None)
+            conn.commit()
+            if ret_id:
+                row = cur.fetchone()
+                return row[0] if row else None
+            return None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+def _init_db_sync():
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id   BIGINT PRIMARY KEY,
+                    username  TEXT,
+                    joined_at TEXT,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sections (
+                    id        SERIAL PRIMARY KEY,
+                    name      TEXT,
+                    parent_id INTEGER DEFAULT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS content (
+                    id         SERIAL PRIMARY KEY,
+                    section_id INTEGER,
+                    name       TEXT,
+                    type       TEXT,
+                    data       TEXT,
+                    file_id    TEXT,
+                    pinned     INTEGER DEFAULT 0,
+                    created_at TEXT DEFAULT to_char(NOW(), 'YYYY-MM-DD HH24:MI')
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS channels (
+                    id       TEXT PRIMARY KEY,
+                    url      TEXT,
+                    username TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sub_admins (
+                    user_id BIGINT PRIMARY KEY
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS requests (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    BIGINT,
+                    username   TEXT,
+                    full_name  TEXT,
+                    message    TEXT,
+                    created_at TEXT DEFAULT to_char(NOW(), 'YYYY-MM-DD HH24:MI'),
+                    answered   INTEGER DEFAULT 0
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sections_parent ON sections(parent_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_content_section ON content(section_id)")
+            cur.execute("SELECT COUNT(*) FROM sections WHERE parent_id IS NULL")
+            count = cur.fetchone()[0]
+            if count == 0:
+                for sec in ["الملازم", "التحفيز", "ارشادات للدراسة", "الملخصات"]:
+                    cur.execute("INSERT INTO sections (name) VALUES (%s)", (sec,))
+            for k, v in [
+                ("sub_notify", "OFF"),
+                ("entry_notify", "OFF"),
+                ("help_text", "أهلاً بك في بوت المساعد الدراسي 🎓"),
+            ]:
+                cur.execute(
+                    "INSERT INTO settings (key,value) VALUES (%s,%s) ON CONFLICT (key) DO NOTHING",
+                    (k, v),
+                )
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        pool.putconn(conn)
+
+# Async wrappers
 async def db_read(query: str, params=(), one=False):
-    pool = await get_pool()
-    pg = _convert_query(query)
-    async with pool.acquire() as conn:
-        if one:
-            row = await conn.fetchrow(pg, *params)
-            return dict(row) if row else None
-        rows = await conn.fetch(pg, *params)
-        return [dict(r) for r in rows]
+    return await asyncio.to_thread(_db_read_sync, query, params, one)
 
 async def db_write(query: str, params=(), ret_id=False):
-    pool = await get_pool()
-    pg = _convert_query(query)
-    if ret_id and "RETURNING" not in pg.upper():
-        pg = pg.rstrip(";") + " RETURNING id"
-    async with pool.acquire() as conn:
-        if ret_id:
-            row = await conn.fetchrow(pg, *params)
-            return row["id"] if row else None
-        await conn.execute(pg, *params)
-        return None
+    return await asyncio.to_thread(_db_write_sync, query, params, ret_id)
 
 async def init_db():
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id   BIGINT PRIMARY KEY,
-                username  TEXT,
-                joined_at TEXT,
-                is_active INTEGER DEFAULT 1
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS sections (
-                id        SERIAL PRIMARY KEY,
-                name      TEXT,
-                parent_id INTEGER DEFAULT NULL
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS content (
-                id         SERIAL PRIMARY KEY,
-                section_id INTEGER,
-                name       TEXT,
-                type       TEXT,
-                data       TEXT,
-                file_id    TEXT,
-                pinned     INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT to_char(NOW(), 'YYYY-MM-DD HH24:MI')
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS channels (
-                id       TEXT PRIMARY KEY,
-                url      TEXT,
-                username TEXT
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS sub_admins (
-                user_id BIGINT PRIMARY KEY
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS requests (
-                id         SERIAL PRIMARY KEY,
-                user_id    BIGINT,
-                username   TEXT,
-                full_name  TEXT,
-                message    TEXT,
-                created_at TEXT DEFAULT to_char(NOW(), 'YYYY-MM-DD HH24:MI'),
-                answered   INTEGER DEFAULT 0
-            )
-        """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_sections_parent ON sections(parent_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_content_section ON content(section_id)")
-        count = await conn.fetchval("SELECT COUNT(*) FROM sections WHERE parent_id IS NULL")
-        if count == 0:
-            for sec in ["الملازم", "التحفيز", "ارشادات للدراسة", "الملخصات"]:
-                await conn.execute("INSERT INTO sections (name) VALUES ($1)", sec)
-        for k, v in [
-            ("sub_notify", "OFF"),
-            ("entry_notify", "OFF"),
-            ("help_text", "أهلاً بك في بوت المساعد الدراسي 🎓"),
-        ]:
-            await conn.execute(
-                "INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING",
-                k, v,
-            )
+    await asyncio.to_thread(_init_db_sync)
 
-# ─── HTTP Health Check (asyncio - بدون thread) ───────────────────────────────
-async def handle_health(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    try:
-        await reader.read(1024)
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK")
-        await writer.drain()
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            pass
+# ─── HTTP Health Check بـ aiohttp ────────────────────────────────────────────
+async def health_handler(request):
+    return web.Response(text="OK")
 
 async def start_health_server():
-    """يشغّل health server بـ asyncio — يتجنب Errno 99 لأنه يعمل بعد استقرار الـ network"""
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
     last_err = None
     for attempt in range(10):
         try:
-            server = await asyncio.start_server(handle_health, "0.0.0.0", PORT)
+            site = web.TCPSite(runner, "0.0.0.0", PORT)
+            await site.start()
             logger.warning(f"✅ HTTP health server على 0.0.0.0:{PORT}")
-            asyncio.create_task(server.serve_forever())
             return
         except OSError as e:
             last_err = e
-            logger.warning(f"⚠️ محاولة {attempt + 1}/10 فشلت: {e} — إعادة المحاولة بعد 3 ثوانٍ")
+            logger.warning(f"⚠️ محاولة {attempt + 1}/10 فشلت ({e}) — إعادة بعد 3 ثوانٍ")
             await asyncio.sleep(3)
-    logger.error(f"❌ فشل تشغيل health server بعد 10 محاولات: {last_err} — البوت سيستمر بدونه")
+    logger.error(f"❌ فشل health server نهائياً: {last_err}")
 
 # ─── مساعدات ──────────────────────────────────────────────────────────────────
 async def get_sub_admins() -> list:
@@ -1143,13 +1183,25 @@ async def process_add_chan(msg: Message, state: FSMContext):
             except:
                 pass
             return await msg.answer(f"❌ البوت ليس مشرفاً في @{username}.\nأضفه كمسؤول وأعد المحاولة.")
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO channels (id, url, username) VALUES ($1, $2, $3) "
-                "ON CONFLICT (id) DO UPDATE SET url=EXCLUDED.url, username=EXCLUDED.username",
-                str(chat_id_val), f"https://t.me/{username}", f"@{username}",
-            )
+
+        def _insert_channel():
+            pool = _get_pool()
+            conn = pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO channels (id, url, username) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (id) DO UPDATE SET url=EXCLUDED.url, username=EXCLUDED.username",
+                        (str(chat_id_val), f"https://t.me/{username}", f"@{username}"),
+                    )
+                    conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                pool.putconn(conn)
+
+        await asyncio.to_thread(_insert_channel)
         cache_del("channels_list")
         try:
             await wm.delete()
@@ -1253,7 +1305,7 @@ async def show_sixth_science(msg: Message):
 
 # ─── التشغيل الرئيسي ─────────────────────────────────────────────────────────
 async def main():
-    # 1) Supabase أولاً
+    # 1) init DB
     await init_db()
     logger.warning("✅ Supabase جاهزة")
 
@@ -1267,10 +1319,10 @@ async def main():
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
 
-    # 4) تشغيل health server بـ asyncio بعد استقرار الـ network
+    # 4) health server بـ aiohttp
     await start_health_server()
 
-    # 5) مهمة تنظيف المحظورين
+    # 5) تنظيف المحظورين
     asyncio.create_task(cleanup_blocked())
 
     logger.warning("🚀 البوت يعمل...")
