@@ -1,8 +1,11 @@
-import logging, asyncio, time, os, re, aiohttp
+import logging, asyncio, time, os, re
 from datetime import datetime
 from typing import Optional
 import warnings
 warnings.filterwarnings("ignore", message='Field "model_.*".*')
+
+from aiohttp import web
+import aiohttp
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -29,7 +32,14 @@ import asyncpg
 TOKEN     = os.environ.get("BOT_TOKEN", "8066171928:AAHXhDfWSWLTFfgBekExFGSyveJSnIT2Dsg")
 ADMIN_IDS = [8605977767, 8774463579]
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+# Supabase PostgreSQL — تخزين دائم ومجاني
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:Yousef12ttgg%40@db.mcomtjqneqjmlmxulrfk.supabase.co:5432/postgres"
+)
+
+# Back4App يحتاج HTTP server على المنفذ 8080
+PORT = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(
     level=logging.WARNING,
@@ -62,13 +72,18 @@ def cache_del(*keys):
 def cache_clear_all():
     _cache.clear(); _cache_ts.clear()
 
-# ─── قاعدة البيانات ───────────────────────────────────────────────────────────
+# ─── قاعدة البيانات Supabase PostgreSQL ──────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
 
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        _pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            ssl="require"
+        )
     return _pool
 
 async def db_read(query: str, params=(), one=False):
@@ -98,14 +113,12 @@ async def db_write(query: str, params=(), ret_id=False):
 def _convert_query(query: str) -> str:
     result = []
     idx = 1
-    i = 0
-    while i < len(query):
-        if query[i] == '?':
+    for ch in query:
+        if ch == '?':
             result.append(f'${idx}')
             idx += 1
         else:
-            result.append(query[i])
-        i += 1
+            result.append(ch)
     q = ''.join(result)
     q = q.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY')
     q = q.replace('INTEGER PRIMARY KEY', 'BIGINT PRIMARY KEY')
@@ -114,6 +127,7 @@ def _convert_query(query: str) -> str:
     return q
 
 async def init_db():
+    """إنشاء جداول Supabase — التخزين دائم لا يُحذف عند إعادة النشر"""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute('''
@@ -172,7 +186,6 @@ async def init_db():
                 answered   INTEGER DEFAULT 0
             )
         ''')
-
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_sections_parent ON sections(parent_id)')
         await conn.execute('CREATE INDEX IF NOT EXISTS idx_content_section ON content(section_id)')
 
@@ -186,6 +199,20 @@ async def init_db():
             await conn.execute(
                 "INSERT INTO settings (key,value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING",
                 k, v)
+
+# ─── HTTP Health Check لـ Back4App (المنفذ 8080) ─────────────────────────────
+async def health_handler(request):
+    return web.Response(text="OK", status=200)
+
+async def start_http_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.warning(f"✅ HTTP server يعمل على المنفذ {PORT}")
 
 # ─── مساعدات ──────────────────────────────────────────────────────────────────
 async def get_sub_admins() -> list:
@@ -249,18 +276,18 @@ async def setup_commands():
 
 # ─── الحالات ──────────────────────────────────────────────────────────────────
 class St(StatesGroup):
-    add_sec_name    = State()
-    add_con_name    = State()
-    add_con_data    = State()
-    add_chan        = State()
-    broadcast       = State()
-    edit_help       = State()
-    add_sub_admin   = State()
-    search_query    = State()
-    send_request    = State()
-    reply_request   = State()
+    add_sec_name  = State()
+    add_con_name  = State()
+    add_con_data  = State()
+    add_chan      = State()
+    broadcast     = State()
+    edit_help     = State()
+    add_sub_admin = State()
+    search_query  = State()
+    send_request  = State()
+    reply_request = State()
 
-# ─── الأخطاء ──────────────────────────────────────────────────────────────────
+# ─── معالج الأخطاء ────────────────────────────────────────────────────────────
 @dp.error()
 async def on_error(event: ErrorEvent):
     exc = event.exception
@@ -369,9 +396,10 @@ async def send_panel(msg: Message, uid: int):
     except: await msg.answer(title, reply_markup=b.as_markup())
 
 @dp.callback_query(F.data == "adm_back")
-async def cb_back(cb: CallbackQuery): await send_panel(cb.message, cb.from_user.id)
+async def cb_back(cb: CallbackQuery):
+    await send_panel(cb.message, cb.from_user.id)
 
-# ─── عرض الطلبات الواردة ─────────────────────────────────────────────────────
+# ─── الطلبات ──────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_requests")
 async def cb_adm_requests(cb: CallbackQuery):
     if not await is_admin(cb.from_user.id):
@@ -410,16 +438,15 @@ async def cb_view_req(cb: CallbackQuery, state: FSMContext):
         f"💬 {req['message']}"
     )
     b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(
-        text="↩️ رد",
-        callback_data=f"reply_req_{req['id']}_{req['user_id']}"))
+    b.row(InlineKeyboardButton(text="↩️ رد", callback_data=f"reply_req_{req['id']}_{req['user_id']}"))
     b.row(InlineKeyboardButton(text="🔙 عودة", callback_data="adm_requests"))
     try: await cb.message.edit_text(text, reply_markup=b.as_markup())
     except: await cb.message.answer(text, reply_markup=b.as_markup())
 
 @dp.callback_query(F.data.startswith("reply_req_"))
 async def cb_reply_req(cb: CallbackQuery, state: FSMContext):
-    if not await is_admin(cb.from_user.id): return await cb.answer("لا صلاحية.", show_alert=True)
+    if not await is_admin(cb.from_user.id):
+        return await cb.answer("لا صلاحية.", show_alert=True)
     parts = cb.data.split("_")
     req_id, user_id = parts[2], parts[3]
     await state.update_data(reply_req_id=req_id, reply_user_id=user_id)
@@ -444,12 +471,12 @@ async def process_reply_request(msg: Message, state: FSMContext):
 async def cb_stats(cb: CallbackQuery):
     if not await is_admin(cb.from_user.id):
         return await cb.answer("لا صلاحية.", show_alert=True)
-    total   = await db_read("SELECT COUNT(*) c FROM users", one=True)
-    active  = await db_read("SELECT COUNT(*) c FROM users WHERE is_active=1", one=True)
-    secs    = await db_read("SELECT COUNT(*) c FROM sections", one=True)
-    cons    = await db_read("SELECT COUNT(*) c FROM content",  one=True)
-    pinned  = await db_read("SELECT COUNT(*) c FROM content WHERE pinned=1", one=True)
-    reqs    = await db_read("SELECT COUNT(*) c FROM requests", one=True)
+    total  = await db_read("SELECT COUNT(*) c FROM users", one=True)
+    active = await db_read("SELECT COUNT(*) c FROM users WHERE is_active=1", one=True)
+    secs   = await db_read("SELECT COUNT(*) c FROM sections", one=True)
+    cons   = await db_read("SELECT COUNT(*) c FROM content", one=True)
+    pinned = await db_read("SELECT COUNT(*) c FROM content WHERE pinned=1", one=True)
+    reqs   = await db_read("SELECT COUNT(*) c FROM requests", one=True)
     top_sec = await db_read(
         "SELECT s.name, COUNT(c.id) cnt FROM sections s "
         "LEFT JOIN content c ON c.section_id=s.id "
@@ -475,10 +502,11 @@ async def cb_stats(cb: CallbackQuery):
     try: await cb.message.edit_text(text, reply_markup=b.as_markup())
     except: await cb.message.answer(text, reply_markup=b.as_markup())
 
-# ─── إدارة المشرفين الفرعيين ──────────────────────────────────────────────────
+# ─── المشرفون الفرعيون ────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_sub_admins")
 async def cb_sub_admins(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS: return await cb.answer("لا صلاحية.", show_alert=True)
+    if cb.from_user.id not in ADMIN_IDS:
+        return await cb.answer("لا صلاحية.", show_alert=True)
     sub_admins = await get_sub_admins()
     b = InlineKeyboardBuilder()
     for sa_id in sub_admins:
@@ -514,7 +542,8 @@ async def process_add_sub(msg: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("del_sub_"))
 async def cb_del_sub(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS: return await cb.answer("لا صلاحية.", show_alert=True)
+    if cb.from_user.id not in ADMIN_IDS:
+        return await cb.answer("لا صلاحية.", show_alert=True)
     try:
         sa_id = int(cb.data.split("del_sub_")[1])
         await db_write("DELETE FROM sub_admins WHERE user_id=?", (sa_id,))
@@ -528,7 +557,8 @@ async def cb_del_sub(cb: CallbackQuery):
 # ─── إدارة الأقسام ────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_secs")
 async def cb_manage_secs(cb: CallbackQuery):
-    if not await is_admin(cb.from_user.id): return await cb.answer("لا صلاحية.", show_alert=True)
+    if not await is_admin(cb.from_user.id):
+        return await cb.answer("لا صلاحية.", show_alert=True)
     secs = await db_read("SELECT * FROM sections WHERE parent_id IS NULL")
     b = InlineKeyboardBuilder()
     for s in (secs or []):
@@ -552,9 +582,9 @@ async def cb_view_sec(cb: CallbackQuery):
         icon = {"photo":"🖼","doc":"📄","voice":"🎤","video":"🎥","audio":"🎵"}.get(c['type'],"📝")
         pin = "📌" if c['pinned'] else ""
         b.row(InlineKeyboardButton(text=f"{pin}{icon} {c['name']}", callback_data=f"adm_con_{c['id']}"))
-    b.row(InlineKeyboardButton(text="➕ قسم فرعي",    callback_data=f"add_sec_sub_{sec_id}"),
-          InlineKeyboardButton(text="➕ محتوى",        callback_data=f"add_con_{sec_id}"))
-    b.row(InlineKeyboardButton(text="🗑 حذف القسم",   callback_data=f"del_sec_{sec_id}"))
+    b.row(InlineKeyboardButton(text="➕ قسم فرعي", callback_data=f"add_sec_sub_{sec_id}"),
+          InlineKeyboardButton(text="➕ محتوى",     callback_data=f"add_con_{sec_id}"))
+    b.row(InlineKeyboardButton(text="🗑 حذف القسم", callback_data=f"del_sec_{sec_id}"))
     back = f"adm_sec_{sec['parent_id']}" if sec['parent_id'] else "adm_secs"
     b.row(InlineKeyboardButton(text="🔙 عودة", callback_data=back))
     try:
@@ -614,23 +644,20 @@ async def process_sec_name(msg: Message, state: FSMContext):
             (name, parent_id), ret_id=True)
         cache_del("main_secs")
         await msg.answer(f"✅ تم إضافة '<b>{name}</b>' (ID: {row_id})")
-    except Exception as e: await msg.answer(f"❌ خطأ: <code>{str(e)[:200]}</code>")
+    except Exception as e:
+        await msg.answer(f"❌ خطأ: <code>{str(e)[:200]}</code>")
     await state.clear()
 
 async def delete_section_recursive(sec_id: int, deleted_by: int = None):
     sec_info = await db_read("SELECT name FROM sections WHERE id=?", (sec_id,), one=True)
     contents = await db_read("SELECT name FROM content WHERE section_id=?", (sec_id,))
     con_names = ", ".join([c['name'] for c in contents]) if contents else "لا يوجد"
-
     await db_write("DELETE FROM content WHERE section_id=?", (sec_id,))
     subs = await db_read("SELECT id FROM sections WHERE parent_id=?", (sec_id,))
     for sub in (subs or []): await delete_section_recursive(sub['id'], deleted_by)
     await db_write("DELETE FROM sections WHERE id=?", (sec_id,))
-
     if deleted_by:
-        try:
-            deleter_info = await bot.get_chat(deleted_by)
-            deleter_name = deleter_info.full_name
+        try: deleter_name = (await bot.get_chat(deleted_by)).full_name
         except: deleter_name = f"ID:{deleted_by}"
         notif = (
             f"🗑 <b>تنبيه حذف قسم</b>\n\n"
@@ -678,12 +705,12 @@ async def process_con_name(msg: Message, state: FSMContext):
 async def process_con_data(msg: Message, state: FSMContext):
     data = await state.get_data()
     c_type, c_data, f_id = "text", msg.text or "", None
-    if msg.photo:         c_type,c_data,f_id = "photo",     msg.caption or "", msg.photo[-1].file_id
-    elif msg.document:    c_type,c_data,f_id = "doc",       msg.caption or "", msg.document.file_id
-    elif msg.voice:       c_type,c_data,f_id = "voice",     msg.caption or "", msg.voice.file_id
-    elif msg.video:       c_type,c_data,f_id = "video",     msg.caption or "", msg.video.file_id
-    elif msg.audio:       c_type,c_data,f_id = "audio",     msg.caption or "", msg.audio.file_id
-    elif msg.video_note:  c_type,c_data,f_id = "video_note","",                msg.video_note.file_id
+    if msg.photo:        c_type,c_data,f_id = "photo",     msg.caption or "", msg.photo[-1].file_id
+    elif msg.document:   c_type,c_data,f_id = "doc",       msg.caption or "", msg.document.file_id
+    elif msg.voice:      c_type,c_data,f_id = "voice",     msg.caption or "", msg.voice.file_id
+    elif msg.video:      c_type,c_data,f_id = "video",     msg.caption or "", msg.video.file_id
+    elif msg.audio:      c_type,c_data,f_id = "audio",     msg.caption or "", msg.audio.file_id
+    elif msg.video_note: c_type,c_data,f_id = "video_note","",                msg.video_note.file_id
     try:
         row_id = await db_write(
             "INSERT INTO content (section_id,name,type,data,file_id,created_at) VALUES (?,?,?,?,?,?)",
@@ -691,7 +718,6 @@ async def process_con_data(msg: Message, state: FSMContext):
              datetime.now().strftime("%Y-%m-%d %H:%M")), ret_id=True)
         cache_clear_all()
         await msg.answer(f"✅ <b>تم الحفظ!</b>\n📌 {data['con_name']}\n📎 {c_type}\n🆔 {row_id}")
-
         adder_id = msg.from_user.id
         try: adder_name = (await bot.get_chat(adder_id)).full_name
         except: adder_name = f"ID:{adder_id}"
@@ -708,7 +734,8 @@ async def process_con_data(msg: Message, state: FSMContext):
             if aid != adder_id:
                 try: await bot.send_message(aid, notif)
                 except: pass
-    except Exception as e: await msg.answer(f"❌ خطأ: <code>{str(e)[:200]}</code>")
+    except Exception as e:
+        await msg.answer(f"❌ خطأ: <code>{str(e)[:200]}</code>")
     await state.clear()
 
 @dp.callback_query(F.data.startswith("del_con_"))
@@ -730,15 +757,11 @@ async def cb_confirm_del(cb: CallbackQuery):
     c_id = cb.data.split("confirm_del_")[1]
     item = await db_read("SELECT * FROM content WHERE id=?", (int(c_id),), one=True)
     if not item: return await cb.answer("❌ محذوف مسبقاً", show_alert=True)
-
     deleter_id = cb.from_user.id
     await db_write("DELETE FROM content WHERE id=?", (int(c_id),))
     cache_clear_all()
     await cb.answer("✅ تم الحذف نهائياً")
-
-    try:
-        deleter_info = await bot.get_chat(deleter_id)
-        deleter_name = deleter_info.full_name
+    try: deleter_name = (await bot.get_chat(deleter_id)).full_name
     except: deleter_name = f"ID:{deleter_id}"
     sec_info = await db_read("SELECT name FROM sections WHERE id=?", (item['section_id'],), one=True)
     notif = (
@@ -773,7 +796,8 @@ async def process_search(msg: Message, state: FSMContext):
     if len(query) < 2: return await msg.answer("❌ كلمة البحث قصيرة جداً.")
     await state.clear()
     secs = await db_read("SELECT * FROM sections WHERE name LIKE ?", (f"%{query}%",))
-    cons = await db_read("SELECT * FROM content WHERE name LIKE ? OR data LIKE ?", (f"%{query}%", f"%{query}%"))
+    cons = await db_read("SELECT * FROM content WHERE name LIKE ? OR data LIKE ?",
+                         (f"%{query}%", f"%{query}%"))
     if not secs and not cons:
         return await msg.answer("❌ لم يتم العثور على نتائج.")
     b = InlineKeyboardBuilder()
@@ -875,13 +899,13 @@ async def cb_user_view(cb: CallbackQuery):
         await cb.answer()
         chat_id = cb.message.chat.id
         t = item['type']
-        if t == "text":        await cb.message.answer(item['data'] or "لا يوجد نص")
-        elif t == "photo":     await bot.send_photo(chat_id, item['file_id'], caption=cap)
-        elif t == "doc":       await bot.send_document(chat_id, item['file_id'], caption=cap)
-        elif t == "voice":     await bot.send_voice(chat_id, item['file_id'], caption=cap)
-        elif t == "video":     await bot.send_video(chat_id, item['file_id'], caption=cap)
-        elif t == "audio":     await bot.send_audio(chat_id, item['file_id'], caption=cap)
-        elif t == "video_note":await bot.send_video_note(chat_id, item['file_id'])
+        if t == "text":         await cb.message.answer(item['data'] or "لا يوجد نص")
+        elif t == "photo":      await bot.send_photo(chat_id, item['file_id'], caption=cap)
+        elif t == "doc":        await bot.send_document(chat_id, item['file_id'], caption=cap)
+        elif t == "voice":      await bot.send_voice(chat_id, item['file_id'], caption=cap)
+        elif t == "video":      await bot.send_video(chat_id, item['file_id'], caption=cap)
+        elif t == "audio":      await bot.send_audio(chat_id, item['file_id'], caption=cap)
+        elif t == "video_note": await bot.send_video_note(chat_id, item['file_id'])
         else: await cb.message.answer("❌ نوع غير معروف")
     except TelegramBadRequest as e:
         logger.error(f"send_content: {e}")
@@ -896,7 +920,8 @@ async def cb_noop(cb: CallbackQuery): await cb.answer()
 # ─── الإذاعة ──────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_bc")
 async def cb_bc(cb: CallbackQuery, state: FSMContext):
-    if not await is_admin(cb.from_user.id): return await cb.answer("لا صلاحية.", show_alert=True)
+    if not await is_admin(cb.from_user.id):
+        return await cb.answer("لا صلاحية.", show_alert=True)
     await cb.message.answer("📣 أرسل رسالة الإذاعة:")
     await state.set_state(St.broadcast)
 
@@ -929,13 +954,17 @@ async def process_broadcast(msg: Message, state: FSMContext):
 
     try:
         await sm.edit_text(
-            f"✅ <b>انتهت الإذاعة:</b>\n📤 نجح: <b>{success}</b>\n❌ فشل: <b>{failed}</b>\n🚫 محظور: <b>{len(blocked)}</b>")
+            f"✅ <b>انتهت الإذاعة:</b>\n"
+            f"📤 نجح: <b>{success}</b>\n"
+            f"❌ فشل: <b>{failed}</b>\n"
+            f"🚫 محظور: <b>{len(blocked)}</b>")
     except: pass
 
 # ─── الاشتراك الإجباري ────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_force")
 async def cb_force(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS: return await cb.answer("لا صلاحية.", show_alert=True)
+    if cb.from_user.id not in ADMIN_IDS:
+        return await cb.answer("لا صلاحية.", show_alert=True)
     chans = await db_read("SELECT * FROM channels")
     b = InlineKeyboardBuilder()
     for c in (chans or []):
@@ -987,12 +1016,10 @@ async def process_add_chan(msg: Message, state: FSMContext):
             try: await wm.delete()
             except: pass
             return await msg.answer(f"❌ البوت ليس مشرفاً في @{username}.\nأضفه كمسؤول وأعد المحاولة.")
-        # ─── إصلاح: استخدام ON CONFLICT الصحيح لـ PostgreSQL ───────────────
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute(
-                """INSERT INTO channels (id, url, username)
-                   VALUES ($1, $2, $3)
+                """INSERT INTO channels (id, url, username) VALUES ($1, $2, $3)
                    ON CONFLICT (id) DO UPDATE
                    SET url = EXCLUDED.url, username = EXCLUDED.username""",
                 str(chat_id_val), f"https://t.me/{username}", f"@{username}"
@@ -1017,7 +1044,8 @@ async def cb_del_chan(cb: CallbackQuery):
 # ─── التنبيهات ────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_notify")
 async def cb_notify(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS: return await cb.answer("لا صلاحية.", show_alert=True)
+    if cb.from_user.id not in ADMIN_IDS:
+        return await cb.answer("لا صلاحية.", show_alert=True)
     sub = await db_read("SELECT value FROM settings WHERE key='sub_notify'",   one=True)
     ent = await db_read("SELECT value FROM settings WHERE key='entry_notify'", one=True)
     sv  = sub['value'] if sub else 'OFF'
@@ -1035,7 +1063,8 @@ async def cb_notify(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("toggle_"))
 async def cb_toggle(cb: CallbackQuery):
-    if cb.from_user.id not in ADMIN_IDS: return await cb.answer("لا صلاحية.", show_alert=True)
+    if cb.from_user.id not in ADMIN_IDS:
+        return await cb.answer("لا صلاحية.", show_alert=True)
     key = 'sub_notify' if 'sub' in cb.data else 'entry_notify'
     res = await db_read("SELECT value FROM settings WHERE key=?", (key,), one=True)
     new_val = "OFF" if res and res['value'] == "ON" else "ON"
@@ -1046,7 +1075,8 @@ async def cb_toggle(cb: CallbackQuery):
 # ─── تعديل الشرح ──────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "adm_help")
 async def cb_adm_help(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id not in ADMIN_IDS: return await cb.answer("لا صلاحية.", show_alert=True)
+    if cb.from_user.id not in ADMIN_IDS:
+        return await cb.answer("لا صلاحية.", show_alert=True)
     res = await db_read("SELECT value FROM settings WHERE key='help_text'", one=True)
     await cb.message.answer(
         f"📝 النص الحالي:\n<i>{res['value'] if res else '—'}</i>\n\nأرسل النص الجديد:")
@@ -1056,12 +1086,11 @@ async def cb_adm_help(cb: CallbackQuery, state: FSMContext):
 async def process_edit_help(msg: Message, state: FSMContext):
     await state.clear()
     new_text = msg.text.strip()
-    if not new_text:
-        return await msg.answer("❌ النص فارغ، لم يتم التحديث.")
+    if not new_text: return await msg.answer("❌ النص فارغ.")
     await db_write("UPDATE settings SET value=? WHERE key=?", (new_text, 'help_text'))
     await msg.answer("✅ تم تحديث نص الشرح بنجاح.")
 
-# ─── قناة البوت ───────────────────────────────────────────────────────────────
+# ─── أزرار قناة البوت / شرح البوت / السادس علمي ──────────────────────────────
 @dp.message(F.text == "📢 قناة البوت")
 async def show_bot_channel(msg: Message):
     chans = await db_read("SELECT url, username FROM channels LIMIT 1")
@@ -1073,44 +1102,51 @@ async def show_bot_channel(msg: Message):
     else:
         await msg.answer("لا توجد قناة مضافة حالياً.")
 
-# ─── شرح البوت ────────────────────────────────────────────────────────────────
 @dp.message(F.text == "ℹ️ شرح البوت")
 async def show_help_text(msg: Message):
     res = await db_read("SELECT value FROM settings WHERE key='help_text'", one=True)
     await msg.answer(res['value'] if res else "لا يوجد شرح.")
 
-# ─── السادس العلمي ────────────────────────────────────────────────────────────
 @dp.message(F.text == "🔬 السادس علمي")
 async def show_sixth_science(msg: Message):
     if not await check_subscription(msg.from_user.id):
         return await msg.answer("⚠️ اشترك أولاً:", reply_markup=await get_sub_kb())
     secs = await db_read("SELECT * FROM sections WHERE parent_id IS NULL")
     b = InlineKeyboardBuilder()
+    icons = {"الملازم":"🗂","التحفيز":"💡","ارشادات":"📝","الملخصات":"📚"}
     for s in (secs or []):
-        icons = {"الملازم":"🗂","التحفيز":"💡","ارشادات":"📝","الملخصات":"📚"}
         icon = next((v for k,v in icons.items() if k in s['name']), "📁")
         b.row(InlineKeyboardButton(text=f"{icon} {s['name']}", callback_data=f"user_sec_{s['id']}"))
     await msg.answer("🔬 <b>السادس العلمي - اختر القسم:</b>", reply_markup=b.as_markup())
 
 # ─── التشغيل الرئيسي ─────────────────────────────────────────────────────────
 async def main():
+    # 1) تشغيل HTTP server أولاً — يمنع Back4App من إيقاف الحاوية
+    await start_http_server()
+
+    # 2) تهيئة قاعدة بيانات Supabase — إنشاء الجداول إذا لم تكن موجودة
     await init_db()
+    logger.warning("✅ Supabase جاهزة — التخزين دائم")
+
+    # 3) إعداد أوامر البوت
     await setup_commands()
 
-    # ─── إصلاح TelegramConflictError: حذف الـ webhook وتنظيف pending updates ──
+    # 4) حذف الـ webhook القديم وتنظيف pending updates — يحل TelegramConflictError
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.warning("✅ تم حذف الـ webhook وتنظيف الرسائل المعلقة")
+        logger.warning("✅ تم حذف الـ webhook")
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
 
+    # 5) مهمة تنظيف المحظورين في الخلفية
     asyncio.create_task(cleanup_blocked())
 
-    logger.warning("🚀 البوت يعمل الآن...")
+    logger.warning("🚀 البوت يعمل...")
+
+    # 6) بدء الـ polling
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types(),
-        # ─── إصلاح: تجاهل الأخطاء وإعادة المحاولة بدلاً من التوقف ──────────
         handle_signals=True,
     )
 
