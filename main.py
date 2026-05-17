@@ -36,14 +36,20 @@ from aiogram.exceptions import (
 TOKEN = os.environ.get("BOT_TOKEN", "8066171928:AAHXhDfWSWLTFfgBekExFGSyveJSnIT2Dsg")
 ADMIN_IDS = [8605977767, 8774463579]
 
+# ─── إعداد الاتصال بـ Supabase ───────────────────────────────────────────────
+# Supabase يوفر Pooler على بورت 6543 (يتجاوز حجب بورت 5432)
 _RAW_DB_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://postgres:Yousef12ttgg%40@db.mcomtjqneqjmlmxulrfk.supabase.co:5432/postgres"
 )
 
 def _build_dsn() -> str:
+    """
+    تحويل DATABASE_URL إلى DSN صحيح مع تغيير البورت إلى 6543
+    لاستخدام Supabase Transaction Pooler الذي يتجاوز حجب بورت 5432.
+    """
     url = _RAW_DB_URL.replace("%40", "@")
-    # استخدام بورت 6543 (Supabase Pooler) بدلاً من 5432 المحجوب
+    # استبدال البورت 5432 بـ 6543 (Supabase Pooler)
     url = url.replace(":5432/", ":6543/")
     return url
 
@@ -92,7 +98,7 @@ def _get_pool() -> pg_pool.ThreadedConnectionPool:
     global _db_pool
     if _db_pool is None:
         dsn = _build_dsn()
-        logger.warning("📡 محاولة الاتصال بـ Supabase...")
+        logger.warning(f"📡 محاولة الاتصال بـ Supabase...")
         _db_pool = pg_pool.ThreadedConnectionPool(
             minconn=1,
             maxconn=8,
@@ -118,7 +124,6 @@ def _convert_query(query: str) -> str:
     return q
 
 def _db_read_sync(query: str, params=(), one=False):
-    global _db_pool
     pool = _get_pool()
     conn = pool.getconn()
     try:
@@ -131,16 +136,14 @@ def _db_read_sync(query: str, params=(), one=False):
             rows = cur.fetchall()
             return [dict(r) for r in rows]
     except psycopg2.OperationalError:
+        # إعادة ضبط الـ pool عند انقطاع الاتصال
+        global _db_pool
         _db_pool = None
         raise
     finally:
-        try:
-            pool.putconn(conn)
-        except Exception:
-            pass
+        pool.putconn(conn)
 
 def _db_write_sync(query: str, params=(), ret_id=False):
-    global _db_pool
     pool = _get_pool()
     conn = pool.getconn()
     try:
@@ -156,16 +159,14 @@ def _db_write_sync(query: str, params=(), ret_id=False):
             return None
     except psycopg2.OperationalError:
         conn.rollback()
+        global _db_pool
         _db_pool = None
         raise
     except Exception:
         conn.rollback()
         raise
     finally:
-        try:
-            pool.putconn(conn)
-        except Exception:
-            pass
+        pool.putconn(conn)
 
 def _init_db_sync():
     pool = _get_pool()
@@ -249,10 +250,7 @@ def _init_db_sync():
         conn.rollback()
         raise
     finally:
-        try:
-            pool.putconn(conn)
-        except Exception:
-            pass
+        pool.putconn(conn)
 
 async def db_read(query: str, params=(), one=False):
     return await asyncio.to_thread(_db_read_sync, query, params, one)
@@ -1213,10 +1211,7 @@ async def process_add_chan(msg: Message, state: FSMContext):
                 conn.rollback()
                 raise
             finally:
-                try:
-                    pool.putconn(conn)
-                except Exception:
-                    pass
+                pool.putconn(conn)
 
         await asyncio.to_thread(_insert_channel)
         cache_del("channels_list")
