@@ -1,12 +1,15 @@
 FROM python:3.11-slim
 
+LABEL version="3.0.0-sqlite"
+
 WORKDIR /app
 
-# إنشاء مجلد البيانات الدائمة
 RUN mkdir -p /data
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# تثبيت المكتبات - SQLite فقط، لا postgres
+RUN pip install --no-cache-dir \
+    aiogram==3.13.1 \
+    aiohttp==3.10.10
 
 COPY main.py .
 
