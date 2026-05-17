@@ -5,14 +5,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
-
-# مجلد البيانات
-RUN mkdir -p /app/data
-
-ENV DB_PATH=/app/data/bot_data.db
-ENV PORT=8080
-
-EXPOSE 8080
+COPY . .
 
 CMD ["python", "main.py"]
